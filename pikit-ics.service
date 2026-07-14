@@ -1,0 +1,18 @@
+[Unit]
+Description=PiKit ICS field console
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/pikit-ics
+EnvironmentFile=/etc/pikit-ics/pikit-ics.env
+ExecStart=/usr/bin/python3 /home/pi/pikit-ics/app.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PiKit ICS Field Console</title>
+  <style>
+    :root { --ink:#e2e6e9; --muted:#99a3aa; --card:#1a1e22; --line:#3b434a; --ok:#78b9e6; --warn:#e4ad5b; --danger:#e2827d; --accent:#e4ad5b; }
+    * { box-sizing:border-box } body { margin:0; background:#111315; color:var(--ink); font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace; }
+    main { max-width:1320px; margin:auto; padding:20px 16px 32px; } header { border-bottom:1px solid var(--line); margin-bottom:16px; }
+    h1 { margin:0; font-size:clamp(1.2rem,3vw,1.7rem); letter-spacing:.04em } h1 span { color:var(--accent) } .tag { color:var(--muted); margin:2px 0 12px; font-size:.85rem; }
+    .tabs { display:flex; gap:4px; margin-bottom:12px; border-bottom:1px solid var(--line); } .tab { border:0; border-radius:3px 3px 0 0; background:transparent; color:var(--muted); padding:7px 12px; cursor:pointer; font-weight:700; } .tab[aria-selected="true"] { background:var(--card); color:var(--accent); border:1px solid var(--line); border-bottom-color:var(--card); margin-bottom:-1px; } .tab-panel[hidden] { display:none; }
+    .sessions { display:grid; gap:0; } .session { min-width:0; padding:12px 0; } .session + .session { border-top:2px solid var(--line); margin-top:8px; padding-top:20px; } .session.management { border-color:#59636b; } .session.field { border-color:#6c5a41; } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; } .card { background:var(--card); border:1px solid var(--line); border-radius:3px; padding:14px; }
+    h2 { font-size:.95rem; margin:0 0 4px; } .note { color:var(--muted); margin-top:0; font-size:.82rem; } .radio { border-left:4px solid var(--accent); padding:6px 8px; background:#15191c; margin:7px 0; font-size:.85rem; } .mode { display:inline-block; border-radius:2px; padding:2px 7px; font-size:.76rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; } .mode.managed { background:#2e383f; color:var(--ink); } .mode.connected { background:#1b3545; color:var(--ok); } .mode.monitor { background:#49391f; color:var(--warn); } .mode.unavailable { background:#422321; color:var(--danger); }
+    form { margin:9px 0 0; } button, select, input { font:inherit; border-radius:2px; padding:7px 9px; } button { border:0; background:var(--accent); color:#1b1610; cursor:pointer; font-weight:700; } button.secondary { background:#303940; color:var(--ink); } button.warn { background:var(--warn); color:#21190e; }
+    select,input { width:100%; color:var(--ink); background:#121619; border:1px solid var(--line); margin:4px 0; } .network-list { max-height:225px; overflow-y:auto; padding-right:6px; } .network { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; padding:7px 0; border-top:1px solid var(--line); } .network small { color:var(--muted); } .flash { border-radius:2px; padding:8px 10px; margin:10px 0; } .flash.ok { background:#1b3545; color:var(--ok) } .flash.error { background:#422321; color:var(--danger) } code { color:var(--ok); } footer { color:var(--muted); font-size:.8rem; margin-top:18px; }
+  </style>
+</head>
+<body><main>
+  <header><h1>PiKit <span>ICS</span></h1><p class="tag">Field console · industrial systems · boat systems · curious work</p></header>
+  {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+  <nav class="tabs" role="tablist" aria-label="Console sections">
+    <button class="tab" id="wifi-tab" role="tab" aria-selected="true" aria-controls="wifi-panel">WiFi</button>
+    <button class="tab" id="docs-tab" role="tab" aria-selected="false" aria-controls="docs-panel">Docs</button>
+  </nav>
+  <section class="tab-panel" id="wifi-panel" role="tabpanel" aria-labelledby="wifi-tab">
+  <section class="sessions">
+    <section class="session management" aria-labelledby="wlan0-title"><h2 id="wlan0-title">Management session · wlan0</h2><p class="note">Safe return path. Saved profiles on this radio reconnect automatically; PiKit AP remains the fallback.</p>
+      {% set radio = radios.get('wlan0') %}<div class="radio"><strong>wlan0</strong> <span class="mode {{ management_mode }}">{{ {'managed':'Managed', 'connected':'Connected', 'monitor':'Monitor mode', 'unavailable':'Unavailable'}[management_mode] }}</span><br><small>{{ radio.connection if radio and radio.connection else 'no active connection' }}</small></div>
+      <div class="grid">
+    <article class="card"><h2>Connection</h2>
+      <form method="post" action="{{ url_for('management_ap') }}"><button>Start PiKit hotspot</button></form>
+      <form method="post" action="{{ url_for('management_connect') }}"><input name="ssid" value="FFLF-ZONE" placeholder="Management Wi-Fi name (SSID)" required><input name="password" type="password" placeholder="Password, if required"><button class="secondary">Join / save management Wi-Fi</button></form>
+    </article>
+    <article class="card"><h2>Saved management profiles</h2><p class="note">Select another saved <code>wlan0</code> profile whenever FFLF-ZONE is not the network you want to use.</p>{% if management_profiles %}<form method="post" action="{{ url_for('management_profile') }}"><select name="profile">{% for profile in management_profiles %}<option value="{{ profile.name }}">{{ profile.ssid }} · {{ profile.name }}</option>{% endfor %}</select><button class="secondary">Use selected profile</button></form>{% else %}<p class="note">No saved management profiles yet.</p>{% endif %}</article>
+    <article class="card"><h2>Nearby management networks</h2>{% if management_networks %}<div class="network-list">{% for network in management_networks %}<div class="network"><div><strong>{{ network.ssid }}</strong><br><small>{{ network.signal }}% · {{ network.security }}</small></div><form method="post" action="{{ url_for('management_connect') }}"><input type="hidden" name="ssid" value="{{ network.ssid }}"><input type="hidden" name="security" value="{{ network.security }}"><button class="secondary">Use</button></form></div>{% endfor %}</div>{% else %}<p class="note">No scan results. Refresh to scan again.</p>{% endif %}</article>
+      </div>
+    </section>
+    <section class="session field" aria-labelledby="wlan1-title"><h2 id="wlan1-title">Field session · wlan1</h2><p class="note">Equipment connections and monitor-mode work stay isolated from management.</p>
+      {% set radio = radios.get('wlan1') %}<div class="radio"><strong>wlan1</strong> <span class="mode {{ field_mode }}">{{ {'managed':'Managed', 'connected':'Connected', 'monitor':'Monitor mode', 'unavailable':'Unavailable'}[field_mode] }}</span><br><small>{{ radio.connection if radio and radio.connection else 'no active connection' }}</small></div>
+      <div class="grid">
+    <article class="card"><h2>Field connection</h2><p class="note">Connect to an equipment network, or place the USB adapter in monitor mode.</p>
+      <form method="post" action="{{ url_for('field_connect') }}"><input name="ssid" placeholder="Equipment Wi-Fi name (SSID)" required><input name="password" type="password" placeholder="Password, if required"><button>Connect wlan1</button></form>
+      <form method="post" action="{{ url_for('field_disconnect') }}"><button class="secondary">Disconnect field radio</button></form>
+      <form method="post" action="{{ url_for('field_monitor') }}"><button class="warn">Enable monitor mode</button></form>
+      <form method="post" action="{{ url_for('field_managed') }}"><button class="secondary">Return to managed mode</button></form>
+    </article>
+    <article class="card"><h2>Nearby field networks</h2>{% if field_networks %}<div class="network-list">{% for network in field_networks %}<div class="network"><div><strong>{{ network.ssid }}</strong><br><small>{{ network.signal }}% · {{ network.security }}</small></div><form method="post" action="{{ url_for('field_connect') }}"><input type="hidden" name="ssid" value="{{ network.ssid }}"><input type="hidden" name="security" value="{{ network.security }}"><button class="secondary">Use</button></form></div>{% endfor %}</div>{% else %}<p class="note">No scan results. Return wlan1 to managed mode and refresh.</p>{% endif %}</article>
+      </div>
+    </section>
+  </section>
+  </section>
+  <section class="tab-panel" id="docs-panel" role="tabpanel" aria-labelledby="docs-tab" hidden>
+    <article class="card"><h2>WiFi</h2><p class="note">This page keeps the two Wi-Fi radios in separate roles so field work cannot accidentally remove the management connection.</p>
+      <div class="grid">
+        <section><h2>Management · wlan0</h2><p>Use this session for the Pi’s normal network connection. It starts with <code>FFLF-ZONE</code>, but you can enter another SSID to save it as a management network. Saved management profiles reconnect automatically; the PiKit hotspot is the fallback when none is available.</p><p>Use <strong>Saved management profiles</strong> to switch to a previously saved wlan0 profile. Use <strong>Nearby management networks</strong> to select a detected network; enter its password on the connection form if it is protected.</p></section>
+        <section><h2>Field · wlan1</h2><p>Use this session only for equipment, boat, or industrial networks. Connections made here are saved on wlan1 but do not reconnect automatically after a reboot.</p><p>Choose a detected network from <strong>Nearby field networks</strong>, or enter its SSID manually. Select <strong>Disconnect field radio</strong> when finished.</p></section>
+        <section><h2>Monitor mode</h2><p><strong>Enable monitor mode</strong> takes wlan1 out of NetworkManager so it can listen for authorized wireless analysis. It cannot scan or join Wi-Fi while in monitor mode. Select <strong>Return to managed mode</strong> before connecting or scanning again.</p></section>
+        <section><h2>Network lists</h2><p>Each nearby-networks list shows about five networks at a time. Scroll inside the list to see additional scan results. Scan results are refreshed when the WiFi tab is loaded.</p></section>
+      </div>
+    </article>
+  </section>
+  <footer>Only use monitor mode and access industrial/boat networks when you are authorized. The console is protected with HTTP Basic authentication.</footer>
+</main><script>
+  const tabs = document.querySelectorAll('[role="tab"]');
+  const panels = document.querySelectorAll('[role="tabpanel"]');
+  tabs.forEach((tab) => tab.addEventListener('click', () => {
+    tabs.forEach((item) => item.setAttribute('aria-selected', item === tab));
+    panels.forEach((panel) => { panel.hidden = panel.id !== tab.getAttribute('aria-controls'); });
+  }));
+</script></body></html>
