@@ -3,9 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if active_sdr_mode %}<meta http-equiv="refresh" content="3">{% endif %}
   <title>PiKit ICS Field Console</title>
   <style>
-    :root { --ink:#e2e6e9; --muted:#99a3aa; --card:#1a1e22; --line:#3b434a; --ok:#78b9e6; --warn:#e4ad5b; --danger:#e2827d; --accent:#e4ad5b; }
+    :root { --ink:#e2e6e9; --muted:#99a3aa; --card:#1a1e22; --line:#3b434a; --ok:#78b9e6; --warn:#e4ad5b; --danger:#e2827d; --accent:#e4ad5b; --seq-1:#0d366b; --seq-2:#256abf; --seq-3:#86b6ef; }
     * { box-sizing:border-box } body { margin:0; background:#111315; color:var(--ink); font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace; }
     main { max-width:1320px; margin:auto; padding:20px 16px 32px; } header { border-bottom:1px solid var(--line); margin-bottom:16px; }
     h1 { margin:0; font-size:clamp(1.2rem,3vw,1.7rem); letter-spacing:.04em } h1 span { color:var(--accent) } .tag { color:var(--muted); margin:2px 0 12px; font-size:.85rem; }
@@ -14,13 +15,17 @@
     h2 { font-size:.95rem; margin:0 0 4px; } .note { color:var(--muted); margin-top:0; font-size:.82rem; } .radio { border-left:4px solid var(--accent); padding:6px 8px; background:#15191c; margin:7px 0; font-size:.85rem; } .mode { display:inline-block; border-radius:2px; padding:2px 7px; font-size:.76rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; } .mode.managed { background:#2e383f; color:var(--ink); } .mode.connected { background:#1b3545; color:var(--ok); } .mode.monitor { background:#49391f; color:var(--warn); } .mode.unavailable { background:#422321; color:var(--danger); }
     form { margin:9px 0 0; } button, select, input { font:inherit; border-radius:2px; padding:7px 9px; } button { border:0; background:var(--accent); color:#1b1610; cursor:pointer; font-weight:700; } button.secondary { background:#303940; color:var(--ink); } button.warn { background:var(--warn); color:#21190e; }
     select,input { width:100%; color:var(--ink); background:#121619; border:1px solid var(--line); margin:4px 0; } .network-list { max-height:225px; overflow-y:auto; padding-right:6px; } .network { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; padding:7px 0; border-top:1px solid var(--line); } .network small { color:var(--muted); } .flash { border-radius:2px; padding:8px 10px; margin:10px 0; } .flash.ok { background:#1b3545; color:var(--ok) } .flash.error { background:#422321; color:var(--danger) } code { color:var(--ok); } footer { color:var(--muted); font-size:.8rem; margin-top:18px; }
+    .chart-wrap svg { width:100%; height:auto; display:block; overflow:visible; } .chart-axis { fill:var(--muted); font-size:9px; } .chart-grid { stroke:var(--line); stroke-width:1; } .chart-area { fill:url(#fmFill); } .chart-line { fill:none; stroke:var(--ok); stroke-width:1.5; } .chart-peak-dot { fill:var(--warn); } .chart-peak-label { fill:var(--warn); font-size:10px; font-weight:700; text-anchor:middle; } .chart-crosshair { stroke:var(--muted); stroke-width:1; stroke-dasharray:2 2; } .chart-tooltip-bg { fill:#0d0f11; stroke:var(--line); } .chart-tooltip { fill:var(--ink); font-size:10px; } .fm-stop-a { stop-color:var(--seq-1); stop-opacity:.35; } .fm-stop-b { stop-color:var(--seq-2); stop-opacity:.75; } .fm-stop-c { stop-color:var(--seq-3); stop-opacity:.95; }
+    .peak-table { width:100%; border-collapse:collapse; font-size:.82rem; } .peak-table th,.peak-table td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); } .peak-table th { color:var(--muted); font-weight:700; text-transform:uppercase; font-size:.7rem; letter-spacing:.04em; } .peak-table form { margin:0; } .peak-table button { padding:4px 10px; white-space:nowrap; }
   </style>
 </head>
 <body><main>
   <header><h1>PiKit <span>ICS</span></h1><p class="tag">Field console · industrial systems · boat systems · curious work</p></header>
   {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+  <div class="tab-group">
   <nav class="tabs" role="tablist" aria-label="Console sections">
     <button class="tab" id="wifi-tab" role="tab" aria-selected="true" aria-controls="wifi-panel">WiFi</button>
+    <button class="tab" id="sdr-tab" role="tab" aria-selected="false" aria-controls="sdr-panel">RTL-SDR</button>
     <button class="tab" id="docs-tab" role="tab" aria-selected="false" aria-controls="docs-panel">Docs</button>
   </nav>
   <section class="tab-panel" id="wifi-panel" role="tabpanel" aria-labelledby="wifi-tab">
@@ -59,13 +64,184 @@
         <section><h2>Network lists</h2><p>Each nearby-networks list shows about five networks at a time. Scroll inside the list to see additional scan results. Scan results are refreshed when the WiFi tab is loaded.</p></section>
       </div>
     </article>
+    <article class="card"><h2>RTL-SDR</h2><p class="note">The console shares one RTL-SDR USB dongle across five tools. Only one can run at a time &mdash; starting a tracker while another is active is refused until you stop it.</p>
+      <div class="grid">
+        <section><h2>FM scan</h2><p><strong>Run FM scan</strong> sweeps 88&ndash;108&nbsp;MHz and plots the spectrum, marking the strongest stations. Hover the chart for the exact frequency and signal level under the cursor.</p><p>Select <strong>Identify</strong> on a detected station to listen live for up to 15 seconds and decode its RDS name. This can fail on a weak signal or a station that doesn't broadcast RDS.</p></section>
+        <section><h2>ADS-B</h2><p><strong>Start ADS-B tracking</strong> decodes 1090&nbsp;MHz squitter messages from nearby aircraft and lists flight, altitude, speed, track, and position. The page refreshes every few seconds while tracking is on. Select <strong>Stop ADS-B tracking</strong> to free the dongle.</p></section>
+        <section><h2>AIS</h2><p><strong>Start AIS tracking</strong> decodes marine AIS broadcasts (161.975/162.025&nbsp;MHz) from nearby vessels and lists name, MMSI, speed, course, and position. A vessel's name only appears once its static data message is received, which can take longer than its position reports.</p></section>
+        <section><h2>LoRa</h2><p><strong>Start LoRa detector</strong> continuously sweeps 915&ndash;928&nbsp;MHz and lists energy bursts (time, frequency, width, signal above that pass's own noise floor). It's a presence finder, not a packet decoder &mdash; it won't show device IDs or payloads, only that something transmitted nearby.</p><p class="note">This band can be noisy from the Pi's own USB3 bus. The detector requires several adjacent bins to rise together (matching real 125&ndash;500&nbsp;kHz LoRa channel widths) and auto-mutes any frequency that re-triggers more often than a real device would transmit, but a persistently busy result usually means local interference, not traffic. Moving the dongle to a USB2 port/hub, using a shorter/shielded USB cable, or adding a ferrite choke typically clears it up.</p></section>
+        <section><h2>One dongle, one tool</h2><p>FM scan/Identify, ADS-B, AIS, and LoRa all need exclusive access to the single RTL-SDR dongle. If a tab shows the dongle is busy, stop the active tracker on its own tab first.</p></section>
+      </div>
+    </article>
   </section>
+  <section class="tab-panel" id="sdr-panel" role="tabpanel" aria-labelledby="sdr-tab" hidden>
+    <div class="tab-group">
+      <nav class="tabs" role="tablist" aria-label="RTL-SDR tools">
+        <button class="tab" id="fm-scan-tab" role="tab" aria-selected="true" aria-controls="fm-scan-panel">FM scan</button>
+        <button class="tab" id="adsb-tab" role="tab" aria-selected="false" aria-controls="adsb-panel">ADS-B</button>
+        <button class="tab" id="ais-tab" role="tab" aria-selected="false" aria-controls="ais-panel">AIS</button>
+        <button class="tab" id="lora-tab" role="tab" aria-selected="false" aria-controls="lora-panel">LoRa</button>
+      </nav>
+      <section class="tab-panel" id="fm-scan-panel" role="tabpanel" aria-labelledby="fm-scan-tab">
+        <p class="note">Sweeps 88&ndash;108&nbsp;MHz with the RTL-SDR dongle and looks for local FM broadcast stations. Read-only: the dongle only receives.</p>
+        {% if active_sdr_mode %}
+        <p class="note">The dongle is busy with {{ active_sdr_mode.upper() }} tracking &mdash; stop it on that tab first.</p>
+        {% else %}
+        <form method="post" action="{{ url_for('sdr_fm_scan') }}"><button>Run FM scan</button></form>
+        {% endif %}
+        {% if fm_chart %}
+        <div class="grid">
+        <article class="card" style="grid-column:1/-1">
+          <h2>Spectrum &middot; 88&ndash;108 MHz</h2>
+          <div class="chart-wrap">
+            <svg viewBox="0 0 {{ fm_chart.width }} {{ fm_chart.height }}" data-samples='{{ fm_chart.hover_samples | tojson }}'>
+              <defs>
+                <linearGradient id="fmFill" x1="0" y1="1" x2="0" y2="0">
+                  <stop offset="0%" class="fm-stop-a"/>
+                  <stop offset="55%" class="fm-stop-b"/>
+                  <stop offset="100%" class="fm-stop-c"/>
+                </linearGradient>
+              </defs>
+              {% for tick in fm_chart.db_ticks %}
+              <line class="chart-grid" x1="{{ fm_chart.plot_left }}" y1="{{ tick.y }}" x2="{{ fm_chart.plot_right }}" y2="{{ tick.y }}"/>
+              <text class="chart-axis" x="2" y="{{ tick.y + 3 }}">{{ tick.label }}</text>
+              {% endfor %}
+              <path class="chart-area" d="{{ fm_chart.area_d }}"/>
+              <path class="chart-line" d="{{ fm_chart.stroke_d }}"/>
+              {% for tick in fm_chart.freq_ticks %}
+              <text class="chart-axis" x="{{ tick.x }}" y="{{ fm_chart.plot_bottom + 14 }}" text-anchor="middle">{{ tick.label }}</text>
+              {% endfor %}
+              {% for peak in fm_chart.peaks %}
+              <circle class="chart-peak-dot" cx="{{ peak.x }}" cy="{{ peak.y }}" r="3"/>
+              <text class="chart-peak-label" x="{{ peak.x }}" y="{{ peak.y + peak.label_dy }}">{{ peak.freq_mhz }}</text>
+              {% endfor %}
+              <line class="chart-crosshair" id="fmCrosshair" x1="0" y1="{{ fm_chart.plot_top }}" x2="0" y2="{{ fm_chart.plot_bottom }}" style="display:none"/>
+              <rect class="chart-tooltip-bg" id="fmTooltipBg" width="90" height="30" rx="3" style="display:none"/>
+              <text class="chart-tooltip" id="fmTooltipFreq" style="display:none"></text>
+              <text class="chart-tooltip" id="fmTooltipDb" style="display:none"></text>
+              <rect id="fmHoverArea" x="{{ fm_chart.plot_left }}" y="{{ fm_chart.plot_top }}" width="{{ fm_chart.plot_right - fm_chart.plot_left }}" height="{{ fm_chart.plot_bottom - fm_chart.plot_top }}" fill="transparent"/>
+            </svg>
+          </div>
+        </article>
+        <article class="card" style="grid-column:1/-1">
+          <h2>Detected stations</h2>
+          {% if fm_peaks %}
+          <table class="peak-table"><thead><tr><th>Frequency</th><th>Signal</th><th>Station</th><th></th></tr></thead><tbody>
+            {% for peak in fm_peaks %}<tr><td>{{ peak.freq_mhz }} MHz</td><td>{{ peak.db }} dB</td><td>{{ peak.name or '—' }}</td><td><form method="post" action="{{ url_for('sdr_fm_identify') }}"><input type="hidden" name="freq_mhz" value="{{ peak.freq_mhz }}"><button class="secondary">Identify</button></form></td></tr>{% endfor %}
+          </tbody></table>
+          <p class="note">Identify listens live for up to 15 seconds to decode the station's RDS name &mdash; it can fail on a weak signal or a station without RDS.</p>
+          {% else %}<p class="note">No stations found above the noise floor.</p>{% endif %}
+        </article>
+        </div>
+        {% else %}
+        <p class="note">No scan yet. Select <strong>Run FM scan</strong> to sweep the FM broadcast band.</p>
+        {% endif %}
+      </section>
+      <section class="tab-panel" id="adsb-panel" role="tabpanel" aria-labelledby="adsb-tab" hidden>
+        <p class="note">Live decode of ADS-B (1090&nbsp;MHz) squitter messages from nearby aircraft. Updates every few seconds while running.</p>
+        {% if active_sdr_mode == 'adsb' %}
+        <form method="post" action="{{ url_for('sdr_adsb_stop') }}"><button class="warn">Stop ADS-B tracking</button></form>
+        {% if adsb_aircraft %}
+        <table class="peak-table"><thead><tr><th>Flight</th><th>Alt (ft)</th><th>Speed (kt)</th><th>Track</th><th>Position</th></tr></thead><tbody>
+          {% for ac in adsb_aircraft %}<tr><td>{{ ac.flight or ac.hex }}</td><td>{{ ac.alt_baro or '—' }}</td><td>{{ ac.gs or '—' }}</td><td>{{ ac.track or '—' }}</td><td>{{ "%.3f"|format(ac.lat) }}, {{ "%.3f"|format(ac.lon) }}</td></tr>{% endfor %}
+        </tbody></table>
+        {% else %}<p class="note">No aircraft decoded yet.</p>{% endif %}
+        {% elif active_sdr_mode %}
+        <p class="note">The dongle is busy with {{ active_sdr_mode.upper() }} tracking &mdash; stop it on that tab first.</p>
+        {% else %}
+        <form method="post" action="{{ url_for('sdr_adsb_start') }}"><button>Start ADS-B tracking</button></form>
+        {% endif %}
+      </section>
+      <section class="tab-panel" id="ais-panel" role="tabpanel" aria-labelledby="ais-tab" hidden>
+        <p class="note">Live decode of AIS (161.975/162.025&nbsp;MHz) position and name broadcasts from nearby vessels. Updates every few seconds while running.</p>
+        {% if active_sdr_mode == 'ais' %}
+        <form method="post" action="{{ url_for('sdr_ais_stop') }}"><button class="warn">Stop AIS tracking</button></form>
+        {% if ais_vessels %}
+        <table class="peak-table"><thead><tr><th>Vessel</th><th>MMSI</th><th>Speed (kt)</th><th>Course</th><th>Position</th></tr></thead><tbody>
+          {% for v in ais_vessels %}<tr><td>{{ v.name or '—' }}</td><td>{{ v.mmsi }}</td><td>{{ v.sog if v.sog is not none else '—' }}</td><td>{{ v.cog if v.cog is not none else '—' }}</td><td>{{ "%.3f"|format(v.lat) }}, {{ "%.3f"|format(v.lon) }}</td></tr>{% endfor %}
+        </tbody></table>
+        {% else %}<p class="note">No vessels decoded yet.</p>{% endif %}
+        {% elif active_sdr_mode %}
+        <p class="note">The dongle is busy with {{ active_sdr_mode.upper() }} tracking &mdash; stop it on that tab first.</p>
+        {% else %}
+        <form method="post" action="{{ url_for('sdr_ais_start') }}"><button>Start AIS tracking</button></form>
+        {% endif %}
+      </section>
+      <section class="tab-panel" id="lora-panel" role="tabpanel" aria-labelledby="lora-tab" hidden>
+        <p class="note">Sweeps 915&ndash;928&nbsp;MHz continuously and flags energy bursts above each pass's noise floor &mdash; a presence/activity finder, not a packet decoder. It won't show device IDs or payloads, only that something transmitted, where, and how strong.</p>
+        {% if active_sdr_mode == 'lora' %}
+        <form method="post" action="{{ url_for('sdr_lora_stop') }}"><button class="warn">Stop LoRa detector</button></form>
+        {% if lora_sightings %}
+        <table class="peak-table"><thead><tr><th>Time</th><th>Frequency</th><th>Width</th><th>Above noise floor</th></tr></thead><tbody>
+          {% for s in lora_sightings %}<tr><td>{{ s.time }}</td><td>{{ s.freq_mhz }} MHz</td><td>{{ s.width_khz }} kHz</td><td>{{ s.db_above_floor }} dB</td></tr>{% endfor %}
+        </tbody></table>
+        {% else %}<p class="note">No bursts detected yet.</p>{% endif %}
+        {% if lora_squelched_count %}<p class="note">{{ lora_squelched_count }} frequenc{{ "y" if lora_squelched_count == 1 else "ies" }} auto-muted as chronic local interference (re-triggered more often than a real device would transmit) rather than genuine traffic.</p>{% endif %}
+        {% elif active_sdr_mode %}
+        <p class="note">The dongle is busy with {{ active_sdr_mode.upper() }} tracking &mdash; stop it on that tab first.</p>
+        {% else %}
+        <form method="post" action="{{ url_for('sdr_lora_start') }}"><button>Start LoRa detector</button></form>
+        {% endif %}
+      </section>
+    </div>
+  </section>
+  </div>
   <footer>Only use monitor mode and access industrial/boat networks when you are authorized. The console is protected with HTTP Basic authentication.</footer>
 </main><script>
-  const tabs = document.querySelectorAll('[role="tab"]');
-  const panels = document.querySelectorAll('[role="tabpanel"]');
-  tabs.forEach((tab) => tab.addEventListener('click', () => {
-    tabs.forEach((item) => item.setAttribute('aria-selected', item === tab));
-    panels.forEach((panel) => { panel.hidden = panel.id !== tab.getAttribute('aria-controls'); });
-  }));
+  document.querySelectorAll('.tab-group').forEach((group) => {
+    const tabs = group.querySelectorAll(':scope > [role="tablist"] [role="tab"]');
+    const panels = group.querySelectorAll(':scope > [role="tabpanel"]');
+    tabs.forEach((tab) => tab.addEventListener('click', () => {
+      tabs.forEach((item) => item.setAttribute('aria-selected', item === tab));
+      panels.forEach((panel) => { panel.hidden = panel.id !== tab.getAttribute('aria-controls'); });
+    }));
+  });
+
+  function revealTab(tab) {
+    if (!tab || tab.getAttribute('role') !== 'tab') return;
+    const parentPanel = tab.closest('.tab-panel');
+    if (parentPanel) revealTab(document.querySelector('[aria-controls="' + parentPanel.id + '"]'));
+    tab.click();
+  }
+
+  if (location.hash) {
+    revealTab(document.getElementById(location.hash.slice(1)));
+  }
+
+  const fmSvg = document.querySelector('svg[data-samples]');
+  if (fmSvg) {
+    const samples = JSON.parse(fmSvg.dataset.samples);
+    const hoverArea = fmSvg.querySelector('#fmHoverArea');
+    const crosshair = fmSvg.querySelector('#fmCrosshair');
+    const tooltipBg = fmSvg.querySelector('#fmTooltipBg');
+    const tooltipFreq = fmSvg.querySelector('#fmTooltipFreq');
+    const tooltipDb = fmSvg.querySelector('#fmTooltipDb');
+    const showTooltip = (show) => {
+      [crosshair, tooltipBg, tooltipFreq, tooltipDb].forEach((el) => { el.style.display = show ? '' : 'none'; });
+    };
+    hoverArea.addEventListener('mouseleave', () => showTooltip(false));
+    hoverArea.addEventListener('mousemove', (event) => {
+      const point = fmSvg.createSVGPoint();
+      point.x = event.clientX;
+      point.y = event.clientY;
+      const svgPoint = point.matrixTransform(fmSvg.getScreenCTM().inverse());
+      let nearest = samples[0];
+      for (const sample of samples) {
+        if (Math.abs(sample[0] - svgPoint.x) < Math.abs(nearest[0] - svgPoint.x)) nearest = sample;
+      }
+      const [x, freqMhz, db] = nearest;
+      crosshair.setAttribute('x1', x);
+      crosshair.setAttribute('x2', x);
+      const boxX = Math.max(0, Math.min(x + 6, fmSvg.viewBox.baseVal.width - 90));
+      tooltipBg.setAttribute('x', boxX);
+      tooltipBg.setAttribute('y', 14);
+      tooltipFreq.setAttribute('x', boxX + 6);
+      tooltipFreq.setAttribute('y', 27);
+      tooltipDb.setAttribute('x', boxX + 6);
+      tooltipDb.setAttribute('y', 40);
+      tooltipFreq.textContent = freqMhz.toFixed(3) + ' MHz';
+      tooltipDb.textContent = db.toFixed(1) + ' dB';
+      showTooltip(true);
+    });
+  }
 </script></body></html>

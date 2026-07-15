@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import functools
+import json
+import math
 import os
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from flask import Flask, flash, redirect, render_template, request, url_for
@@ -18,6 +22,34 @@ MANAGEMENT = "wlan0"
 FIELD = "wlan1"
 MANAGEMENT_SSID = "FFLF-ZONE"
 SAFE_NAME = re.compile(r"^[^\x00-\x1f]{1,96}$")
+FM_RANGE = "88M:108M:12.5k"
+CHART_SIZE = {"width": 880, "height": 220}
+CHART_MARGIN = {"left": 36, "right": 10, "top": 14, "bottom": 26}
+LAST_FM_SCAN: dict[str, object] | None = None
+REDSEA_BIN = str(Path(__file__).parent / "bin" / "redsea")
+RDS_SAMPLE_RATE = "171000"
+RDS_LISTEN_SECONDS = 15
+READSB_BIN = str(Path(__file__).parent / "bin" / "readsb")
+ADSB_JSON_DIR = Path("/run/pikit-ics-adsb")
+ACTIVE_SDR_SESSION: dict[str, object] | None = None
+AIS_VESSELS: dict[int, dict[str, object]] = {}
+AIS_LOCK = threading.Lock()
+AIS_CHARSET = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_ !\"#$%&'()*+,-./0123456789:;<=>?"
+LORA_RANGE = "915M:928M:25k"
+LORA_BURST_THRESHOLD_DB = 8.0
+LORA_MAX_SIGHTINGS = 100
+LORA_QUIET_ALPHA = 0.2  # baseline adapts quickly to a bin's normal (quiet) level
+LORA_BUSY_ALPHA = 0.02  # ...but barely moves while a bin is mid-burst, so it can't "learn" the burst as normal
+LORA_SQUELCH_WINDOW_SEC = 30  # a real LoRaWAN device transmits at most every few minutes...
+LORA_SQUELCH_TRIGGER_COUNT = 3  # ...so >3 rising edges in this window means chronic local noise, not traffic
+LORA_MIN_RUN_BINS = 4  # ~100kHz+ at our 25kHz step; real chirps (125/250/500kHz) light up several
+# bins together, unlike an isolated broadband-noise spike in a single bin
+LORA_SIGHTINGS: list[dict[str, object]] = []
+LORA_BASELINE: dict[int, float] = {}  # bin key (freq rounded to 1 kHz) -> EMA noise floor in dB
+LORA_ACTIVE: set[int] = set()  # bins currently above threshold, so only the rising edge gets logged
+LORA_TRIGGER_LOG: dict[int, list[float]] = {}  # bin key -> recent rising-edge timestamps
+LORA_SQUELCHED: set[int] = set()  # bins auto-muted as chronic interference, not real bursts
+LORA_LOCK = threading.Lock()
 
 
 def run(*args: str, timeout: int = 25) -> subprocess.CompletedProcess[str]:
@@ -143,10 +175,417 @@ def save_wifi_profile(interface: str, ssid: str, password: str, security: str, a
     return run(*args, timeout=45)
 
 
+def parse_power_csv(text: str) -> list[tuple[float, float]]:
+    """Flatten rtl_power's chunked CSV rows into sorted (freq_hz, db) samples."""
+    samples: list[tuple[float, float]] = []
+    for line in text.splitlines():
+        values = line.split(",")
+        if len(values) < 7:
+            continue
+        low, step = float(values[2]), float(values[4])
+        samples.extend((low + i * step, float(db)) for i, db in enumerate(values[6:]))
+    samples.sort(key=lambda item: item[0])
+    return samples
+
+
+def find_fm_peaks(
+    samples: list[tuple[float, float]],
+    min_separation_hz: float = 200_000,
+    threshold_db: float = 6.0,
+    max_peaks: int = 12,
+) -> list[dict[str, float]]:
+    """Pick the strongest bins clear of the noise floor, one per station."""
+    noise_floor = sorted(db for _, db in samples)[len(samples) // 2]
+    candidates = sorted(
+        (item for item in samples if item[1] - noise_floor >= threshold_db),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    peaks: list[dict[str, float]] = []
+    for freq, db in candidates:
+        if any(abs(freq - peak["freq_hz"]) < min_separation_hz for peak in peaks):
+            continue
+        peaks.append({"freq_hz": freq, "freq_mhz": round(freq / 1e6, 1), "db": round(db, 1), "name": None})
+        if len(peaks) >= max_peaks:
+            break
+    peaks.sort(key=lambda peak: peak["freq_hz"])
+    return peaks
+
+
+def run_fm_scan() -> dict[str, object]:
+    """Run a single-shot rtl_power sweep of the FM broadcast band."""
+    result = run("rtl_power", "-f", FM_RANGE, "-i", "1", "-1", timeout=45)
+    if result.returncode != 0:
+        return {"error": output(result) or "rtl_power failed. Is the RTL-SDR dongle connected?"}
+    samples = parse_power_csv(result.stdout)
+    if not samples:
+        return {"error": "rtl_power returned no data."}
+    return {"samples": samples, "peaks": find_fm_peaks(samples)}
+
+
+def identify_fm_station(freq_hz: float) -> dict[str, str]:
+    """Live-decode a station's RDS PS (station name) by listening for a few seconds."""
+    try:
+        tuner = subprocess.Popen(
+            ("rtl_fm", "-f", f"{freq_hz:.0f}", "-M", "fm", "-l", "0", "-A", "std", "-s", RDS_SAMPLE_RATE, "-g", "20"),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        decoder = subprocess.Popen(
+            (REDSEA_BIN, "-r", RDS_SAMPLE_RATE),
+            stdin=tuner.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError as error:
+        return {"error": str(error)}
+    tuner.stdout.close()
+
+    timer = threading.Timer(RDS_LISTEN_SECONDS, lambda: (tuner.terminate(), decoder.terminate()))
+    timer.start()
+    name = None
+    for line in decoder.stdout:
+        try:
+            group = json.loads(line)
+        except ValueError:
+            continue
+        if group.get("ps"):
+            name = group["ps"].strip()
+    timer.cancel()
+    tuner.wait(timeout=5)
+    decoder.wait(timeout=5)
+
+    if name:
+        return {"name": name}
+    return {"error": f"No station name decoded within {RDS_LISTEN_SECONDS}s. The signal may be weak or not carry RDS."}
+
+
+def build_fm_chart(scan_result: dict[str, object]) -> dict[str, object]:
+    """Turn raw scan samples into ready-to-render SVG geometry (paths, ticks, peak markers)."""
+    samples: list[tuple[float, float]] = scan_result["samples"]
+    low_hz, high_hz = samples[0][0], samples[-1][0]
+    dbs = [db for _, db in samples]
+    min_db, max_db = min(dbs), max(dbs)
+    pad = max((max_db - min_db) * 0.08, 1.0)
+    min_db, max_db = min_db - pad, max_db + pad
+
+    left, top = CHART_MARGIN["left"], CHART_MARGIN["top"]
+    plot_w = CHART_SIZE["width"] - left - CHART_MARGIN["right"]
+    plot_h = CHART_SIZE["height"] - top - CHART_MARGIN["bottom"]
+    baseline_y = top + plot_h
+
+    def x_of(freq: float) -> float:
+        return left + (freq - low_hz) / (high_hz - low_hz) * plot_w
+
+    def y_of(db: float) -> float:
+        return top + (1 - (db - min_db) / (max_db - min_db)) * plot_h
+
+    buckets: list[float | None] = [None] * (int(plot_w) + 1)
+    for freq, db in samples:
+        col = min(max(int(x_of(freq)) - left, 0), int(plot_w))
+        if buckets[col] is None or db > buckets[col]:
+            buckets[col] = db
+
+    points = []
+    hover_samples = []
+    last_db = min_db
+    for col in range(int(plot_w) + 1):
+        db = buckets[col] if buckets[col] is not None else last_db
+        last_db = db
+        x = left + col
+        freq_mhz = (low_hz + col / plot_w * (high_hz - low_hz)) / 1e6
+        points.append((x, y_of(db)))
+        hover_samples.append([x, round(freq_mhz, 3), round(db, 1)])
+
+    stroke_d = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+    area_d = (
+        f"M {points[0][0]:.1f},{baseline_y:.1f} L "
+        + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        + f" L {points[-1][0]:.1f},{baseline_y:.1f} Z"
+    )
+
+    freq_ticks = []
+    tick_mhz = math.ceil(low_hz / 4_000_000) * 4
+    while tick_mhz * 1_000_000 <= high_hz + 1:
+        freq_ticks.append({"x": round(x_of(tick_mhz * 1_000_000), 1), "label": str(tick_mhz)})
+        tick_mhz += 4
+
+    db_ticks = [
+        {"y": round(y_of(min_db), 1), "label": str(round(min_db))},
+        {"y": round(y_of((min_db + max_db) / 2), 1), "label": str(round((min_db + max_db) / 2))},
+        {"y": round(y_of(max_db), 1), "label": str(round(max_db))},
+    ]
+
+    peaks = [
+        {
+            "x": round(x_of(peak["freq_hz"]), 1),
+            "y": round(y_of(peak["db"]), 1),
+            "label_dy": -18 if i % 2 == 0 else -30,
+            "freq_mhz": peak["freq_mhz"],
+            "db": peak["db"],
+            "name": peak.get("name"),
+        }
+        for i, peak in enumerate(scan_result["peaks"])
+    ]
+
+    return {
+        "width": CHART_SIZE["width"],
+        "height": CHART_SIZE["height"],
+        "area_d": area_d,
+        "stroke_d": stroke_d,
+        "plot_top": top,
+        "plot_bottom": round(baseline_y, 1),
+        "plot_left": left,
+        "plot_right": round(left + plot_w, 1),
+        "freq_ticks": freq_ticks,
+        "db_ticks": db_ticks,
+        "peaks": peaks,
+        "hover_samples": hover_samples,
+    }
+
+
+def start_adsb_tracking() -> subprocess.Popen:
+    """Launch readsb against the dongle, writing a periodically-refreshed aircraft.json."""
+    ADSB_JSON_DIR.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen(
+        (
+            READSB_BIN, "--device-type", "rtlsdr", "--device", "0", "--gain", "-10",
+            "--write-json", str(ADSB_JSON_DIR), "--write-json-every", "1", "--quiet",
+        ),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def read_adsb_aircraft() -> list[dict[str, object]]:
+    try:
+        data = json.loads((ADSB_JSON_DIR / "aircraft.json").read_text())
+    except (OSError, ValueError):
+        return []
+    aircraft = [
+        {
+            "hex": entry.get("hex", "").upper(),
+            "flight": (entry.get("flight") or "").strip() or None,
+            "lat": entry.get("lat"),
+            "lon": entry.get("lon"),
+            "alt_baro": entry.get("alt_baro"),
+            "gs": entry.get("gs"),
+            "track": entry.get("track"),
+        }
+        for entry in data.get("aircraft", [])
+        if "lat" in entry and "lon" in entry
+    ]
+    aircraft.sort(key=lambda a: a["flight"] or a["hex"])
+    return aircraft
+
+
+def _bits_to_int(bits: str, signed: bool = False) -> int:
+    value = int(bits, 2)
+    if signed and bits[0] == "1":
+        value -= 1 << len(bits)
+    return value
+
+
+def _armor_to_bits(payload: str) -> str:
+    """Decode AIS's 6-bit ASCII armoring (AIVDM payload) into a raw bit string."""
+    bits = []
+    for char in payload:
+        value = ord(char) - 48
+        if value > 40:
+            value -= 8
+        bits.append(format(value, "06b"))
+    return "".join(bits)
+
+
+def _decode_ais_string(bits: str) -> str:
+    chars = (AIS_CHARSET[_bits_to_int(bits[i : i + 6])] for i in range(0, len(bits) - 5, 6))
+    return "".join(chars).rstrip("@ ").strip()
+
+
+_ais_fragments: dict[str, list[str | None]] = {}
+
+
+def _apply_ais_message(bits: str) -> None:
+    if len(bits) < 38:
+        return
+    msg_type = _bits_to_int(bits[0:6])
+    mmsi = _bits_to_int(bits[8:38])
+    with AIS_LOCK:
+        vessel = AIS_VESSELS.setdefault(
+            mmsi, {"mmsi": mmsi, "name": None, "lat": None, "lon": None, "sog": None, "cog": None}
+        )
+        if msg_type in (1, 2, 3) and len(bits) >= 128:
+            raw_lon = _bits_to_int(bits[61:89], signed=True)
+            raw_lat = _bits_to_int(bits[89:116], signed=True)
+            if raw_lon != 108_600_000 and raw_lat != 54_600_000:
+                vessel["lon"] = round(raw_lon / 600_000.0, 5)
+                vessel["lat"] = round(raw_lat / 600_000.0, 5)
+            vessel["sog"] = round(_bits_to_int(bits[50:60]) / 10.0, 1)
+            vessel["cog"] = round(_bits_to_int(bits[116:128]) / 10.0, 1)
+        elif msg_type == 5 and len(bits) >= 232:
+            name = _decode_ais_string(bits[112:232])
+            if name:
+                vessel["name"] = name
+        vessel["last_seen"] = time.time()
+
+
+def _decode_ais_line(line: str) -> None:
+    """Parse one !AIVDM NMEA sentence, reassembling multi-part messages by sequence id."""
+    body = line.strip().split("*", 1)[0]
+    fields = body.split(",")
+    if len(fields) < 7 or not (fields[0] == "!AIVDM" or fields[0] == "!AIVDO"):
+        return
+    try:
+        total, frag_num = int(fields[1]), int(fields[2])
+        payload, fill_bits = fields[5], int(fields[6])
+    except ValueError:
+        return
+
+    if total == 1:
+        bits = _armor_to_bits(payload)
+        _apply_ais_message(bits[: len(bits) - fill_bits] if fill_bits else bits)
+        return
+
+    key = fields[3] or "_"
+    parts = _ais_fragments.setdefault(key, [None] * total)
+    if 0 <= frag_num - 1 < total:
+        parts[frag_num - 1] = payload
+    if all(part is not None for part in parts):
+        bits = _armor_to_bits("".join(parts))
+        _apply_ais_message(bits[: len(bits) - fill_bits] if fill_bits else bits)
+        del _ais_fragments[key]
+
+
+def start_ais_tracking() -> tuple[subprocess.Popen, threading.Thread]:
+    """Launch rtl_ais against the dongle and pump its NMEA log into AIS_VESSELS."""
+    process = subprocess.Popen(("rtl_ais", "-n"), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+
+    def pump() -> None:
+        for line in process.stderr:
+            _decode_ais_line(line)
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    return process, thread
+
+
+def read_ais_vessels() -> list[dict[str, object]]:
+    with AIS_LOCK:
+        vessels = [dict(vessel) for vessel in AIS_VESSELS.values() if vessel.get("lat") is not None]
+    vessels.sort(key=lambda vessel: vessel["name"] or str(vessel["mmsi"]))
+    return vessels
+
+
+def _process_lora_line(line: str) -> None:
+    """Flag runs of several adjacent bins that rise together above their own historical
+    baselines (not the pass's median, which is skewed by the dongle's per-hop filter shape).
+
+    A single isolated bin spiking is far more likely to be broadband noise (this band is prone
+    to RTL-SDR + USB3 self-interference on a Pi) than a real signal — a genuine LoRa chirp is
+    125/250/500kHz wide and lights up several neighboring bins together, so only a qualifying
+    run of LORA_MIN_RUN_BINS or more is treated as a candidate burst.
+
+    Only the rising edge (a qualifying run newly appearing) is logged — one that keeps
+    reappearing more often than a real LoRaWAN device would ever transmit gets squelched."""
+    values = line.strip().split(",")
+    if len(values) < 7:
+        return
+    try:
+        low, step = float(values[2]), float(values[4])
+        dbs = [float(v) for v in values[6:]]
+    except ValueError:
+        return
+
+    now = time.time()
+    keys = [round((low + i * step) / 1000) for i in range(len(dbs))]  # 1 kHz buckets: stable across passes
+
+    elevated = []
+    for key, db in zip(keys, dbs):
+        baseline = LORA_BASELINE.get(key)
+        if baseline is None:
+            LORA_BASELINE[key] = db
+            elevated.append(False)
+        else:
+            elevated.append(db - baseline >= LORA_BURST_THRESHOLD_DB)
+
+    qualifying = [False] * len(dbs)
+    i = 0
+    while i < len(dbs):
+        if not elevated[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(dbs) and elevated[j]:
+            j += 1
+        if j - i >= LORA_MIN_RUN_BINS:
+            qualifying[i:j] = [True] * (j - i)
+        i = j
+
+    i = 0
+    while i < len(dbs):
+        if not qualifying[i]:
+            key = keys[i]
+            LORA_ACTIVE.discard(key)
+            baseline = LORA_BASELINE[key]
+            LORA_BASELINE[key] = baseline * (1 - LORA_QUIET_ALPHA) + dbs[i] * LORA_QUIET_ALPHA
+            i += 1
+            continue
+
+        j = i
+        while j < len(dbs) and qualifying[j]:
+            j += 1
+        peak_offset = max(range(i, j), key=lambda idx: dbs[idx])
+        peak_key = keys[peak_offset]
+        for idx in range(i, j):
+            LORA_BASELINE[keys[idx]] = LORA_BASELINE[keys[idx]] * (1 - LORA_BUSY_ALPHA) + dbs[idx] * LORA_BUSY_ALPHA
+
+        if peak_key not in LORA_ACTIVE:
+            LORA_ACTIVE.add(peak_key)
+            freq_mhz = round((low + peak_offset * step) / 1e6, 3)
+            if peak_key in LORA_SQUELCHED:
+                pass
+            else:
+                triggers = LORA_TRIGGER_LOG.setdefault(peak_key, [])
+                triggers.append(now)
+                triggers[:] = [t for t in triggers if now - t < LORA_SQUELCH_WINDOW_SEC]
+                if len(triggers) > LORA_SQUELCH_TRIGGER_COUNT:
+                    LORA_SQUELCHED.add(peak_key)
+                    with LORA_LOCK:
+                        LORA_SIGHTINGS[:] = [s for s in LORA_SIGHTINGS if s["freq_mhz"] != freq_mhz]
+                else:
+                    with LORA_LOCK:
+                        LORA_SIGHTINGS.insert(0, {
+                            "ts": now,
+                            "time": time.strftime("%H:%M:%S", time.localtime(now)),
+                            "freq_mhz": freq_mhz,
+                            "db_above_floor": round(dbs[peak_offset] - LORA_BASELINE[peak_key], 1),
+                            "width_khz": round((j - i) * step / 1000, 1),
+                        })
+                        del LORA_SIGHTINGS[LORA_MAX_SIGHTINGS:]
+        i = j
+
+
+def start_lora_tracking() -> tuple[subprocess.Popen, threading.Thread]:
+    """Continuously sweep the LoRa ISM sub-band, flagging energy bursts (not packet decoding)."""
+    process = subprocess.Popen(
+        ("rtl_power", "-f", LORA_RANGE, "-i", "1"), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+    )
+
+    def pump() -> None:
+        for line in process.stdout:
+            _process_lora_line(line)
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    return process, thread
+
+
+def read_lora_sightings() -> list[dict[str, object]]:
+    with LORA_LOCK:
+        return list(LORA_SIGHTINGS)
+
+
 @app.get("/")
 @require_auth
 def index():
     radios = {radio["device"]: radio for radio in status()}
+    fm_chart = build_fm_chart(LAST_FM_SCAN) if LAST_FM_SCAN and "error" not in LAST_FM_SCAN else None
     return render_template(
         "index.html",
         radios=radios,
@@ -155,6 +594,13 @@ def index():
         management_networks=scan(MANAGEMENT),
         management_profiles=wireless_profiles(MANAGEMENT),
         field_networks=scan(FIELD),
+        fm_chart=fm_chart,
+        fm_peaks=(LAST_FM_SCAN or {}).get("peaks", []),
+        active_sdr_mode=ACTIVE_SDR_SESSION["mode"] if ACTIVE_SDR_SESSION else None,
+        adsb_aircraft=read_adsb_aircraft() if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "adsb" else [],
+        ais_vessels=read_ais_vessels() if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "ais" else [],
+        lora_sightings=read_lora_sightings() if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "lora" else [],
+        lora_squelched_count=len(LORA_SQUELCHED),
     )
 
 
@@ -263,6 +709,138 @@ def field_managed():
             return redirect(url_for("index"))
     flash("wlan1 is back in managed mode and ready to join field equipment Wi-Fi.", "ok")
     return redirect(url_for("index"))
+
+
+def dongle_busy_redirect(anchor: str):
+    """Refuse to start a new SDR session while another one holds the (single) dongle."""
+    if ACTIVE_SDR_SESSION is not None:
+        flash(f"Stop {ACTIVE_SDR_SESSION['mode'].upper()} tracking first — the dongle is in use.", "error")
+        return redirect(url_for("index", _anchor=anchor))
+    return None
+
+
+@app.post("/sdr/fm-scan")
+@require_auth
+def sdr_fm_scan():
+    global LAST_FM_SCAN
+    busy = dongle_busy_redirect("fm-scan-tab")
+    if busy:
+        return busy
+    LAST_FM_SCAN = run_fm_scan()
+    if "error" in LAST_FM_SCAN:
+        flash(LAST_FM_SCAN["error"], "error")
+    else:
+        flash(f"FM scan complete: {len(LAST_FM_SCAN['peaks'])} station(s) found.", "ok")
+    return redirect(url_for("index", _anchor="fm-scan-tab"))
+
+
+@app.post("/sdr/fm-identify")
+@require_auth
+def sdr_fm_identify():
+    busy = dongle_busy_redirect("fm-scan-tab")
+    if busy:
+        return busy
+    try:
+        freq_mhz = float(request.form.get("freq_mhz", ""))
+    except ValueError:
+        flash("Invalid frequency.", "error")
+        return redirect(url_for("index", _anchor="fm-scan-tab"))
+    if not 87.0 <= freq_mhz <= 109.0:
+        flash("Frequency must be within the FM broadcast band.", "error")
+        return redirect(url_for("index", _anchor="fm-scan-tab"))
+
+    result = identify_fm_station(freq_mhz * 1e6)
+    if LAST_FM_SCAN and "peaks" in LAST_FM_SCAN:
+        for peak in LAST_FM_SCAN["peaks"]:
+            if abs(peak["freq_mhz"] - freq_mhz) < 0.05:
+                peak["name"] = result.get("name")
+    if "error" in result:
+        flash(result["error"], "error")
+    else:
+        flash(f"{freq_mhz} MHz: {result['name']}", "ok")
+    return redirect(url_for("index", _anchor="fm-scan-tab"))
+
+
+@app.post("/sdr/adsb/start")
+@require_auth
+def sdr_adsb_start():
+    global ACTIVE_SDR_SESSION
+    busy = dongle_busy_redirect("adsb-tab")
+    if busy:
+        return busy
+    ACTIVE_SDR_SESSION = {"mode": "adsb", "process": start_adsb_tracking()}
+    flash("ADS-B tracking started.", "ok")
+    return redirect(url_for("index", _anchor="adsb-tab"))
+
+
+@app.post("/sdr/adsb/stop")
+@require_auth
+def sdr_adsb_stop():
+    global ACTIVE_SDR_SESSION
+    if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "adsb":
+        ACTIVE_SDR_SESSION["process"].terminate()
+        ACTIVE_SDR_SESSION["process"].wait(timeout=5)
+        ACTIVE_SDR_SESSION = None
+        flash("ADS-B tracking stopped.", "ok")
+    return redirect(url_for("index", _anchor="adsb-tab"))
+
+
+@app.post("/sdr/ais/start")
+@require_auth
+def sdr_ais_start():
+    global ACTIVE_SDR_SESSION
+    busy = dongle_busy_redirect("ais-tab")
+    if busy:
+        return busy
+    process, thread = start_ais_tracking()
+    ACTIVE_SDR_SESSION = {"mode": "ais", "process": process, "thread": thread}
+    with AIS_LOCK:
+        AIS_VESSELS.clear()
+    flash("AIS tracking started.", "ok")
+    return redirect(url_for("index", _anchor="ais-tab"))
+
+
+@app.post("/sdr/ais/stop")
+@require_auth
+def sdr_ais_stop():
+    global ACTIVE_SDR_SESSION
+    if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "ais":
+        ACTIVE_SDR_SESSION["process"].terminate()
+        ACTIVE_SDR_SESSION["process"].wait(timeout=5)
+        ACTIVE_SDR_SESSION = None
+        flash("AIS tracking stopped.", "ok")
+    return redirect(url_for("index", _anchor="ais-tab"))
+
+
+@app.post("/sdr/lora/start")
+@require_auth
+def sdr_lora_start():
+    global ACTIVE_SDR_SESSION
+    busy = dongle_busy_redirect("lora-tab")
+    if busy:
+        return busy
+    process, thread = start_lora_tracking()
+    ACTIVE_SDR_SESSION = {"mode": "lora", "process": process, "thread": thread}
+    with LORA_LOCK:
+        LORA_SIGHTINGS.clear()
+    LORA_BASELINE.clear()
+    LORA_ACTIVE.clear()
+    LORA_TRIGGER_LOG.clear()
+    LORA_SQUELCHED.clear()
+    flash("LoRa activity detector started.", "ok")
+    return redirect(url_for("index", _anchor="lora-tab"))
+
+
+@app.post("/sdr/lora/stop")
+@require_auth
+def sdr_lora_stop():
+    global ACTIVE_SDR_SESSION
+    if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "lora":
+        ACTIVE_SDR_SESSION["process"].terminate()
+        ACTIVE_SDR_SESSION["process"].wait(timeout=5)
+        ACTIVE_SDR_SESSION = None
+        flash("LoRa activity detector stopped.", "ok")
+    return redirect(url_for("index", _anchor="lora-tab"))
 
 
 if __name__ == "__main__":
