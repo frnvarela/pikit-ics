@@ -52,6 +52,13 @@ active is refused until you stop it (this is enforced server-side, not just in t
   moving the dongle to a USB2 port/hub, a shorter/shielded USB cable, or a ferrite choke
   typically clears it up.
 
+## GNSS
+
+A fourth console tab reads position/heading data from a GNSS receiver connected over
+USB-serial (built for the Unicore UM982 dual-antenna RTK module, but any NMEA-0183
+receiver works for position). It depends on the packaged `python3-serial`
+(`apt install python3-serial`), installed automatically by `install.sh`.
+
 ### Why two binaries are built from source
 
 `bin/redsea` and `bin/readsb` are compiled locally (not tracked in git — see

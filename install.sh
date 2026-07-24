@@ -6,6 +6,9 @@ if [ "${EUID}" -ne 0 ]; then
   exit 1
 fi
 
+# python3-serial (pyserial) is required by the GNSS tab to read the USB-serial receiver.
+apt-get install -y python3-serial
+
 install -d -m 700 /etc/pikit-ics
 if [ ! -f /etc/pikit-ics/pikit-ics.env ]; then
   password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
