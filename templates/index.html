@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  {% if active_sdr_mode %}<meta http-equiv="refresh" content="3">{% endif %}
+  {% if active_sdr_mode or gnss_active %}<meta http-equiv="refresh" content="3">{% endif %}
   <title>PiKit ICS Field Console</title>
   <style>
     :root { --ink:#e2e6e9; --muted:#99a3aa; --card:#1a1e22; --line:#3b434a; --ok:#78b9e6; --warn:#e4ad5b; --danger:#e2827d; --accent:#e4ad5b; --seq-1:#0d366b; --seq-2:#256abf; --seq-3:#86b6ef; }
@@ -17,6 +17,7 @@
     select,input { width:100%; color:var(--ink); background:#121619; border:1px solid var(--line); margin:4px 0; } .network-list { max-height:225px; overflow-y:auto; padding-right:6px; } .network { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; padding:7px 0; border-top:1px solid var(--line); } .network small { color:var(--muted); } .flash { border-radius:2px; padding:8px 10px; margin:10px 0; } .flash.ok { background:#1b3545; color:var(--ok) } .flash.error { background:#422321; color:var(--danger) } code { color:var(--ok); } footer { color:var(--muted); font-size:.8rem; margin-top:18px; }
     .chart-wrap svg { width:100%; height:auto; display:block; overflow:visible; } .chart-axis { fill:var(--muted); font-size:9px; } .chart-grid { stroke:var(--line); stroke-width:1; } .chart-area { fill:url(#fmFill); } .chart-line { fill:none; stroke:var(--ok); stroke-width:1.5; } .chart-peak-dot { fill:var(--warn); } .chart-peak-label { fill:var(--warn); font-size:10px; font-weight:700; text-anchor:middle; } .chart-crosshair { stroke:var(--muted); stroke-width:1; stroke-dasharray:2 2; } .chart-tooltip-bg { fill:#0d0f11; stroke:var(--line); } .chart-tooltip { fill:var(--ink); font-size:10px; } .fm-stop-a { stop-color:var(--seq-1); stop-opacity:.35; } .fm-stop-b { stop-color:var(--seq-2); stop-opacity:.75; } .fm-stop-c { stop-color:var(--seq-3); stop-opacity:.95; }
     .peak-table { width:100%; border-collapse:collapse; font-size:.82rem; } .peak-table th,.peak-table td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); } .peak-table th { color:var(--muted); font-weight:700; text-transform:uppercase; font-size:.7rem; letter-spacing:.04em; } .peak-table form { margin:0; } .peak-table button { padding:4px 10px; white-space:nowrap; }
+    .scroll-box { max-height:260px; overflow-y:auto; }
   </style>
 </head>
 <body><main>
@@ -26,6 +27,7 @@
   <nav class="tabs" role="tablist" aria-label="Console sections">
     <button class="tab" id="wifi-tab" role="tab" aria-selected="true" aria-controls="wifi-panel">WiFi</button>
     <button class="tab" id="sdr-tab" role="tab" aria-selected="false" aria-controls="sdr-panel">RTL-SDR</button>
+    <button class="tab" id="gnss-tab" role="tab" aria-selected="false" aria-controls="gnss-panel">GNSS</button>
     <button class="tab" id="docs-tab" role="tab" aria-selected="false" aria-controls="docs-panel">Docs</button>
   </nav>
   <section class="tab-panel" id="wifi-panel" role="tabpanel" aria-labelledby="wifi-tab">
@@ -71,6 +73,15 @@
         <section><h2>AIS</h2><p><strong>Start AIS tracking</strong> decodes marine AIS broadcasts (161.975/162.025&nbsp;MHz) from nearby vessels and lists name, MMSI, speed, course, and position. A vessel's name only appears once its static data message is received, which can take longer than its position reports.</p></section>
         <section><h2>LoRa</h2><p><strong>Start LoRa detector</strong> continuously sweeps 915&ndash;928&nbsp;MHz and lists energy bursts (time, frequency, width, signal above that pass's own noise floor). It's a presence finder, not a packet decoder &mdash; it won't show device IDs or payloads, only that something transmitted nearby.</p><p class="note">This band can be noisy from the Pi's own USB3 bus. The detector requires several adjacent bins to rise together (matching real 125&ndash;500&nbsp;kHz LoRa channel widths) and auto-mutes any frequency that re-triggers more often than a real device would transmit, but a persistently busy result usually means local interference, not traffic. Moving the dongle to a USB2 port/hub, using a shorter/shielded USB cable, or adding a ferrite choke typically clears it up.</p></section>
         <section><h2>One dongle, one tool</h2><p>FM scan/Identify, ADS-B, AIS, and LoRa all need exclusive access to the single RTL-SDR dongle. If a tab shows the dongle is busy, stop the active tracker on its own tab first.</p></section>
+      </div>
+    </article>
+    <article class="card"><h2>GNSS</h2><p class="note">Reads position/fix data from a GNSS receiver connected over USB-serial &mdash; built for the Unicore UM982 dual-antenna RTK module.</p>
+      <div class="grid">
+        <section><h2>Starting</h2><p>Select <strong>Detect port &amp; baud</strong> to have the console probe every <code>/dev/ttyUSB*</code>/<code>/dev/ttyACM*</code> device at common baud rates and read back whatever it finds sending real NMEA or Unicore data &mdash; it prefills the port/baud fields on a match, usually in a couple of seconds. You can still enter both manually instead; the UM982 defaults to 115200 baud. Either way, select <strong>Start GNSS tracking</strong> once the fields are set. If the port fails to open, check the USB cable and that nothing else on the Pi already has it open.</p></section>
+        <section><h2>Fix quality</h2><p>The console reports the receiver's own NMEA GGA fix quality field as-is: No fix, GPS (autonomous), DGPS, RTK float, or RTK fixed. <strong>RTK fixed/float requires the receiver to already be configured with a correction stream</strong> (its own base station or an NTRIP source) &mdash; this console only displays what the receiver reports, it does not supply corrections.</p></section>
+        <section><h2>Azimuth (dual-antenna heading)</h2><p>The UM982's headline feature: with both antennas connected (ANT1 = master, ANT2 = slave), it computes a heading &mdash; the clockwise angle from true north to the master&rarr;slave baseline &mdash; independent of motion, unlike GPS course-over-ground. This has no standard NMEA sentence on this receiver; it only ships as the Unicore <code>UNIHEADINGA</code> log, which the console also parses.</p><p><strong>The receiver must be told to send it</strong>, once, over a serial terminal at its working baud rate (a USB cable and something like <code>screen</code>/<code>minicom</code>, not this console): send <code>UNIHEADINGA 1</code> (1&nbsp;Hz on the current port) then <code>SAVECONFIG</code> so it survives a power cycle. Without this, the Azimuth/Pitch/Baseline/Heading-quality rows stay blank even though position still works.</p><p><strong>Heading quality</strong> mirrors position fix quality but for the baseline solution: <em>RTK fixed</em> (Unicore <code>NARROW_INT</code>) is the precise, intended state; <em>RTK wide-lane fixed</em>/float states are usable but coarser; <em>No solution</em> means the receiver hasn't resolved a baseline yet (needs both antennas connected, clear sky, and a moment to converge). <strong>Antenna placement matters</strong>: heading is only accurate along the physical ANT1&rarr;ANT2 line, so mount both antennas fixed relative to whatever you want the azimuth of (e.g. a vehicle or vessel's bow line), not arbitrarily.</p></section>
+        <section><h2>Events &amp; telemetry log</h2><p><strong>Events</strong> lists only meaningful changes since you started using the console: session started/stopped, first fix acquired, fix-quality changes (e.g. GPS &rarr; RTK fixed, or a dropped fix), first heading acquired, and heading-quality changes &mdash; not a line per second, just the moments that matter. <strong>Telemetry log</strong> is the full picture: one row roughly every second showing fix/position/azimuth/heading at that moment, so you can scroll back through what happened during a session instead of only seeing the latest reading. Both lists <strong>persist across Stop/Start</strong> &mdash; only the live snapshot above resets when you start again &mdash; and are capped (200 events, 500 telemetry rows) so they don't grow forever.</p></section>
+        <section><h2>Stopping</h2><p>Select <strong>Stop GNSS tracking</strong> to close the serial port. Starting again clears the previously displayed fix until a new NMEA sentence (or UNIHEADINGA log) arrives.</p></section>
       </div>
     </article>
   </section>
@@ -184,6 +195,61 @@
         {% endif %}
       </section>
     </div>
+  </section>
+  <section class="tab-panel" id="gnss-panel" role="tabpanel" aria-labelledby="gnss-tab" hidden>
+    <p class="note">Reads NMEA-0183 sentences (GGA/RMC/GSA) from a GNSS receiver over USB-serial &mdash; built for the Unicore UM982 dual-antenna RTK module, but any NMEA-speaking GNSS receiver works the same way. RTK fixed/float status requires the receiver to already have a correction stream configured; this console only reads what the receiver reports, it does not supply corrections. Dual-antenna azimuth additionally requires the UM982's own <code>UNIHEADINGA</code> log, which has no NMEA equivalent &mdash; see Docs.</p>
+    {% if gnss_active %}
+    <form method="post" action="{{ url_for('gnss_stop') }}"><button class="warn">Stop GNSS tracking</button></form>
+    {% if gnss_fix %}
+    <table class="peak-table">
+      <tr><th>Fix quality</th><td>{{ gnss_fix_quality.get(gnss_fix.get('fix_quality'), 'Unknown (' ~ gnss_fix.get('fix_quality') ~ ')') if gnss_fix.get('fix_quality') else 'Waiting for fix' }}</td></tr>
+      <tr><th>Satellites</th><td>{{ gnss_fix.get('satellites') if gnss_fix.get('satellites') is not none else '—' }}</td></tr>
+      <tr><th>HDOP</th><td>{{ gnss_fix.get('hdop') if gnss_fix.get('hdop') is not none else '—' }}</td></tr>
+      <tr><th>Position</th><td>{% if gnss_fix.get('lat') is not none and gnss_fix.get('lon') is not none %}{{ "%.6f"|format(gnss_fix.get('lat')) }}, {{ "%.6f"|format(gnss_fix.get('lon')) }}{% else %}—{% endif %}</td></tr>
+      <tr><th>Altitude</th><td>{{ "%.1f m"|format(gnss_fix.get('alt_m')) if gnss_fix.get('alt_m') is not none else '—' }}</td></tr>
+      <tr><th>Speed</th><td>{{ "%.1f kt"|format(gnss_fix.get('speed_knots')) if gnss_fix.get('speed_knots') is not none else '—' }}</td></tr>
+      <tr><th>Course</th><td>{{ "%.0f°"|format(gnss_fix.get('course_deg')) if gnss_fix.get('course_deg') is not none else '—' }}</td></tr>
+      {% set heading_valid = gnss_fix.get('heading_pos_type') and gnss_fix.get('heading_pos_type') != 'NONE' %}
+      <tr><th>Azimuth (dual-antenna)</th><td>{{ "%.1f°"|format(gnss_fix.get('heading_deg')) if heading_valid and gnss_fix.get('heading_deg') is not none else '—' }}</td></tr>
+      <tr><th>Heading quality</th><td>{% if gnss_fix.get('heading_pos_type') %}{{ gnss_heading_pos_type.get(gnss_fix.get('heading_pos_type'), gnss_fix.get('heading_pos_type')) }} &mdash; {{ gnss_heading_sol_status.get(gnss_fix.get('heading_status'), gnss_fix.get('heading_status')) if gnss_fix.get('heading_status') else 'Unknown' }}{% else %}—{% endif %}</td></tr>
+      <tr><th>Pitch</th><td>{{ "%.1f°"|format(gnss_fix.get('pitch_deg')) if heading_valid and gnss_fix.get('pitch_deg') is not none else '—' }}</td></tr>
+      <tr><th>Baseline length</th><td>{{ "%.3f m"|format(gnss_fix.get('heading_baseline_m')) if heading_valid and gnss_fix.get('heading_baseline_m') is not none else '—' }}</td></tr>
+      <tr><th>Heading std dev</th><td>{{ "%.2f°"|format(gnss_fix.get('heading_std_dev')) if heading_valid and gnss_fix.get('heading_std_dev') is not none else '—' }}</td></tr>
+      <tr><th>Last update</th><td>{{ gnss_fix.get('updated') or '—' }}</td></tr>
+    </table>
+    {% if not heading_valid %}<p class="note">No azimuth yet &mdash; either the receiver isn't sending <code>UNIHEADINGA</code> (enable it once via a serial terminal, see Docs), or it hasn't resolved a heading solution yet (needs both antennas connected with a clear sky view).</p>{% endif %}
+    {% else %}
+    <p class="note">Connected &mdash; waiting for the first NMEA sentence.</p>
+    {% endif %}
+    {% else %}
+    <form method="post" action="{{ url_for('gnss_detect') }}"><button class="secondary">Detect port &amp; baud</button></form>
+    {% if gnss_detected %}<p class="note">Auto-detected {{ gnss_detected.port }} @ {{ gnss_detected.baud }} baud &mdash; prefilled below, confirm and start.</p>{% endif %}
+    <form method="post" action="{{ url_for('gnss_start') }}">
+      <input name="port" list="gnss-ports" value="{{ gnss_detected.port if gnss_detected else (gnss_ports[0] if gnss_ports else '') }}" placeholder="/dev/ttyUSB0" required>
+      <datalist id="gnss-ports">{% for port in gnss_ports %}<option value="{{ port }}">{% endfor %}</datalist>
+      <input name="baud" type="number" value="{{ gnss_detected.baud if gnss_detected else gnss_default_baud }}" placeholder="Baud rate" required>
+      <button>Start GNSS tracking</button>
+    </form>
+    {% if not gnss_ports %}<p class="note">No <code>/dev/ttyUSB*</code> or <code>/dev/ttyACM*</code> device detected yet &mdash; plug in the receiver and refresh, or enter its port manually.</p>{% endif %}
+    {% endif %}
+    {% if gnss_events %}
+    <h2>Events</h2>
+    <div class="scroll-box"><table class="peak-table"><thead><tr><th>Time</th><th>Event</th></tr></thead><tbody>
+      {% for e in gnss_events %}<tr><td>{{ e.time }}</td><td>{{ e.message }}</td></tr>{% endfor %}
+    </tbody></table></div>
+    {% endif %}
+    {% if gnss_telemetry %}
+    <h2>Telemetry log</h2>
+    <div class="scroll-box"><table class="peak-table"><thead><tr><th>Time</th><th>Fix</th><th>Position</th><th>Azimuth</th><th>Heading</th></tr></thead><tbody>
+      {% for t in gnss_telemetry %}<tr>
+        <td>{{ t.get('updated') or '—' }}</td>
+        <td>{{ gnss_fix_quality.get(t.get('fix_quality'), '—') if t.get('fix_quality') else '—' }}</td>
+        <td>{% if t.get('lat') is not none and t.get('lon') is not none %}{{ "%.5f"|format(t.get('lat')) }}, {{ "%.5f"|format(t.get('lon')) }}{% else %}—{% endif %}</td>
+        <td>{{ "%.1f°"|format(t.get('heading_deg')) if t.get('heading_pos_type') and t.get('heading_pos_type') != 'NONE' and t.get('heading_deg') is not none else '—' }}</td>
+        <td>{{ gnss_heading_pos_type.get(t.get('heading_pos_type'), t.get('heading_pos_type')) if t.get('heading_pos_type') else '—' }}</td>
+      </tr>{% endfor %}
+    </tbody></table></div>
+    {% endif %}
   </section>
   </div>
   <footer>Only use monitor mode and access industrial/boat networks when you are authorized. The console is protected with HTTP Basic authentication.</footer>

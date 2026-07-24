@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import glob
 import json
 import math
 import os
@@ -13,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+import serial
 from flask import Flask, flash, redirect, render_template, request, url_for
 
 app = Flask(__name__)
@@ -50,6 +52,41 @@ LORA_ACTIVE: set[int] = set()  # bins currently above threshold, so only the ris
 LORA_TRIGGER_LOG: dict[int, list[float]] = {}  # bin key -> recent rising-edge timestamps
 LORA_SQUELCHED: set[int] = set()  # bins auto-muted as chronic interference, not real bursts
 LORA_LOCK = threading.Lock()
+
+GNSS_PORT_GLOBS = ("/dev/ttyUSB*", "/dev/ttyACM*")
+GNSS_DEFAULT_BAUD = 115200
+# Tried in this order against every detected port: the UM982's own default first,
+# then other rates common on GNSS/serial gear. Each combination gets one bounded
+# read, so keep this list short — it's multiplied by port count on every /gnss/detect.
+GNSS_PROBE_BAUDS = (115200, 230400, 9600, 38400, 57600, 460800)
+GNSS_FIX_QUALITY = {
+    "0": "No fix", "1": "GPS", "2": "DGPS", "3": "PPS",
+    "4": "RTK fixed", "5": "RTK float", "6": "Estimated",
+}
+# UNIHEADINGA pos-type/sol-status enums, Unicore Reference Commands Manual for N4
+# High Precision Products, Table 0-4 / Table 0-5 — only entries relevant to a
+# UM982 dual-antenna heading solution, unlisted values fall back to the raw string.
+GNSS_HEADING_POS_TYPE = {
+    "NONE": "No solution", "NARROW_INT": "RTK fixed", "WIDE_INT": "RTK wide-lane fixed",
+    "NARROW_FLOAT": "RTK narrow-lane float", "L1_FLOAT": "L1 float", "L1_INT": "L1 fixed",
+    "INS": "INS-derived", "INS_RTKFLOAT": "INS + RTK float", "INS_RTKFIXED": "INS + RTK fixed",
+}
+GNSS_HEADING_SOL_STATUS = {
+    "SOL_COMPUTED": "Solution computed", "INSUFFICIENT_OBS": "Insufficient observations",
+    "NO_CONVERGENCE": "No convergence", "COV_TRACE": "Covariance exceeds maximum",
+}
+GNSS_SESSION: dict[str, object] | None = None  # {"serial": Serial, "thread": Thread}
+GNSS_FIX: dict[str, object] = {}
+GNSS_LOCK = threading.Lock()
+GNSS_DETECTED: dict[str, object] | None = None  # {"port": str, "baud": int}, last successful auto-detect
+GNSS_EVENTS_MAX = 200          # milestones are rare — this spans days of field use
+GNSS_TELEMETRY_MAX = 500       # ~1 row/sec -> last ~8min, kept across start/stop cycles
+GNSS_TELEMETRY_MIN_INTERVAL = 1.0  # throttle: at most one telemetry row per second
+GNSS_EVENTS: list[dict[str, object]] = []       # newest-first: {"ts", "time", "message"}
+GNSS_TELEMETRY: list[dict[str, object]] = []    # newest-first: a GNSS_FIX snapshot per tick
+GNSS_LAST_FIX_QUALITY: str | None = None       # baseline for detecting a fix-quality transition
+GNSS_LAST_HEADING_POS_TYPE: str | None = None  # baseline for detecting a heading transition
+GNSS_LAST_TELEMETRY_TS = 0.0
 
 
 def run(*args: str, timeout: int = 25) -> subprocess.CompletedProcess[str]:
@@ -581,6 +618,216 @@ def read_lora_sightings() -> list[dict[str, object]]:
         return list(LORA_SIGHTINGS)
 
 
+def list_serial_ports() -> list[str]:
+    ports: set[str] = set()
+    for pattern in GNSS_PORT_GLOBS:
+        ports.update(glob.glob(pattern))
+    return sorted(ports)
+
+
+def _nmea_checksum_ok(sentence: str) -> bool:
+    body, star, checksum = sentence.partition("*")
+    if not star or not body.startswith("$") or len(checksum) < 2:
+        return False
+    computed = 0
+    for char in body[1:]:
+        computed ^= ord(char)
+    try:
+        return computed == int(checksum[:2], 16)
+    except ValueError:
+        return False
+
+
+def _nmea_coordinate(value: str, hemisphere: str, degree_digits: int) -> float | None:
+    if not value:
+        return None
+    degrees = int(value[:degree_digits])
+    minutes = float(value[degree_digits:])
+    coordinate = degrees + minutes / 60
+    return -coordinate if hemisphere in ("S", "W") else coordinate
+
+
+def _log_gnss_event(message: str) -> None:
+    """Append a milestone to GNSS_EVENTS. Caller must already hold GNSS_LOCK —
+    this never acquires it itself, since Lock isn't reentrant and every call site
+    is already inside a `with GNSS_LOCK:` block guarding a GNSS_FIX update."""
+    now = time.time()
+    GNSS_EVENTS.insert(0, {"ts": now, "time": time.strftime("%H:%M:%S", time.localtime(now)), "message": message})
+    del GNSS_EVENTS[GNSS_EVENTS_MAX:]
+
+
+def _check_fix_quality_transition(quality: str) -> None:
+    """Log a GNSS_EVENTS entry only when GGA's fix-quality value actually changes
+    (not on every GGA), the same rising-edge-only philosophy LoRa detection
+    already uses to avoid a 1Hz flood of unchanged-state noise."""
+    global GNSS_LAST_FIX_QUALITY
+    if quality == GNSS_LAST_FIX_QUALITY:
+        return
+    new_label = GNSS_FIX_QUALITY.get(quality, f"Unknown ({quality})")
+    if GNSS_LAST_FIX_QUALITY is None:
+        _log_gnss_event(f"Fix acquired: {new_label}")
+    else:
+        prev_label = GNSS_FIX_QUALITY.get(GNSS_LAST_FIX_QUALITY, f"Unknown ({GNSS_LAST_FIX_QUALITY})")
+        _log_gnss_event(f"Fix quality changed: {prev_label} → {new_label}")
+    GNSS_LAST_FIX_QUALITY = quality
+
+
+def _check_heading_transition(pos_type: str) -> None:
+    """Same rising-edge logging as _check_fix_quality_transition, for the
+    dual-antenna heading solution's own status (UNIHEADINGA pos_type)."""
+    global GNSS_LAST_HEADING_POS_TYPE
+    if pos_type == GNSS_LAST_HEADING_POS_TYPE:
+        return
+    new_label = GNSS_HEADING_POS_TYPE.get(pos_type, pos_type)
+    if GNSS_LAST_HEADING_POS_TYPE is None:
+        _log_gnss_event(f"Heading acquired: {new_label}")
+    else:
+        prev_label = GNSS_HEADING_POS_TYPE.get(GNSS_LAST_HEADING_POS_TYPE, GNSS_LAST_HEADING_POS_TYPE)
+        _log_gnss_event(f"Heading quality changed: {prev_label} → {new_label}")
+    GNSS_LAST_HEADING_POS_TYPE = pos_type
+
+
+def _log_gnss_telemetry_if_due() -> None:
+    """Append a full GNSS_FIX snapshot to GNSS_TELEMETRY, throttled to at most
+    once per GNSS_TELEMETRY_MIN_INTERVAL — GGA/RMC/GSA (and UNIHEADINGA) usually
+    arrive in a tight burst for the same epoch, so without this a single 1Hz
+    update would otherwise log up to four near-duplicate rows. Caller must
+    already hold GNSS_LOCK, same reentrancy note as _log_gnss_event."""
+    global GNSS_LAST_TELEMETRY_TS
+    now = time.time()
+    if now - GNSS_LAST_TELEMETRY_TS < GNSS_TELEMETRY_MIN_INTERVAL:
+        return
+    GNSS_LAST_TELEMETRY_TS = now
+    GNSS_TELEMETRY.insert(0, dict(GNSS_FIX))
+    del GNSS_TELEMETRY[GNSS_TELEMETRY_MAX:]
+
+
+def _apply_nmea_sentence(sentence: str) -> None:
+    """Update GNSS_FIX from one NMEA-0183 sentence (GGA position/fix quality, RMC
+    speed/course, GSA fix dimensionality) — talker id (GP/GN/GA/...) is ignored
+    since the UM982 reports a combined GNSS solution under GN."""
+    if not _nmea_checksum_ok(sentence):
+        return
+    fields = sentence.split("*", 1)[0].split(",")
+    kind = fields[0][-3:]
+    with GNSS_LOCK:
+        if kind == "GGA" and len(fields) >= 10:
+            GNSS_FIX["lat"] = _nmea_coordinate(fields[2], fields[3], 2)
+            GNSS_FIX["lon"] = _nmea_coordinate(fields[4], fields[5], 3)
+            GNSS_FIX["fix_quality"] = fields[6]
+            GNSS_FIX["satellites"] = int(fields[7]) if fields[7] else None
+            GNSS_FIX["hdop"] = float(fields[8]) if fields[8] else None
+            GNSS_FIX["alt_m"] = float(fields[9]) if fields[9] else None
+            _check_fix_quality_transition(fields[6])
+        elif kind == "RMC" and len(fields) >= 9:
+            GNSS_FIX["speed_knots"] = float(fields[7]) if fields[7] else None
+            GNSS_FIX["course_deg"] = float(fields[8]) if fields[8] else None
+        elif kind == "GSA" and len(fields) >= 3:
+            GNSS_FIX["fix_type"] = fields[2] or None
+        else:
+            return
+        now = time.time()
+        GNSS_FIX["last_seen"] = now
+        GNSS_FIX["updated"] = time.strftime("%H:%M:%S", time.localtime(now))
+        _log_gnss_telemetry_if_due()
+
+
+def _apply_unicore_log(line: str) -> None:
+    """Update GNSS_FIX from a Unicore proprietary ASCII log — currently just
+    UNIHEADINGA, the UM982's dual-antenna heading solution (azimuth from true
+    north to the master->slave antenna baseline, plus its own quality/status
+    fields), which has no standard-NMEA equivalent on this receiver. Field
+    layout: Unicore Reference Commands Manual for N4 High Precision Products,
+    section 7.3.48 / Table 7-118 (header;sol_stat,pos_type,length,heading,pitch,...)."""
+    header, semi, body = line.split("*", 1)[0].partition(";")
+    if not semi or not header.startswith("#UNIHEADINGA"):
+        return
+    fields = body.split(",")
+    if len(fields) < 11:
+        return
+    with GNSS_LOCK:
+        GNSS_FIX["heading_status"] = fields[0] or None
+        GNSS_FIX["heading_pos_type"] = fields[1] or None
+        GNSS_FIX["heading_baseline_m"] = float(fields[2]) if fields[2] else None
+        GNSS_FIX["heading_deg"] = float(fields[3]) if fields[3] else None
+        GNSS_FIX["pitch_deg"] = float(fields[4]) if fields[4] else None
+        GNSS_FIX["heading_std_dev"] = float(fields[6]) if fields[6] else None
+        GNSS_FIX["heading_satellites"] = int(fields[10]) if fields[10] else None
+        _check_heading_transition(fields[1])
+        now = time.time()
+        GNSS_FIX["last_seen"] = now
+        GNSS_FIX["updated"] = time.strftime("%H:%M:%S", time.localtime(now))
+        _log_gnss_telemetry_if_due()
+
+
+def _pump_gnss(connection: serial.Serial) -> None:
+    while True:
+        try:
+            line = connection.readline().decode("ascii", errors="ignore").strip()
+        except (OSError, serial.SerialException):
+            return
+        if not line:
+            continue
+        try:
+            if line.startswith("#"):
+                _apply_unicore_log(line)
+            else:
+                _apply_nmea_sentence(line)
+        except (ValueError, IndexError):
+            continue
+
+
+def start_gnss_tracking(port: str, baud: int) -> tuple[serial.Serial, threading.Thread]:
+    connection = serial.Serial(port, baudrate=baud, timeout=2)
+    thread = threading.Thread(target=_pump_gnss, args=(connection,), daemon=True)
+    thread.start()
+    return connection, thread
+
+
+def read_gnss_fix() -> dict[str, object]:
+    with GNSS_LOCK:
+        return dict(GNSS_FIX)
+
+
+def read_gnss_events() -> list[dict[str, object]]:
+    with GNSS_LOCK:
+        return list(GNSS_EVENTS)
+
+
+def read_gnss_telemetry() -> list[dict[str, object]]:
+    with GNSS_LOCK:
+        return list(GNSS_TELEMETRY)
+
+
+def _looks_like_gnss_data(text: str) -> bool:
+    for line in text.splitlines():
+        line = line.strip()
+        if _nmea_checksum_ok(line):
+            return True
+        if line.startswith("#") and ";" in line and "*" in line:
+            return True
+    return False
+
+
+def detect_gnss_receiver() -> tuple[str, int] | None:
+    """Try every /dev/ttyUSB*|ttyACM* port at each of GNSS_PROBE_BAUDS, reading
+    for a bounded window at each combination, until one produces a recognizable
+    NMEA sentence or Unicore ASCII log — the wrong baud rate on the right port
+    just reads back framing-error noise, which won't checksum or look like a log,
+    so it's naturally rejected without needing to know the port in advance."""
+    for port in list_serial_ports():
+        for baud in GNSS_PROBE_BAUDS:
+            try:
+                with serial.Serial(port, baudrate=baud, timeout=0.6) as connection:
+                    connection.reset_input_buffer()
+                    raw = connection.read(2000)
+            except (OSError, serial.SerialException):
+                continue
+            if _looks_like_gnss_data(raw.decode("ascii", errors="ignore")):
+                return port, baud
+    return None
+
+
 @app.get("/")
 @require_auth
 def index():
@@ -601,6 +848,16 @@ def index():
         ais_vessels=read_ais_vessels() if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "ais" else [],
         lora_sightings=read_lora_sightings() if ACTIVE_SDR_SESSION and ACTIVE_SDR_SESSION["mode"] == "lora" else [],
         lora_squelched_count=len(LORA_SQUELCHED),
+        gnss_active=GNSS_SESSION is not None,
+        gnss_ports=list_serial_ports(),
+        gnss_default_baud=GNSS_DEFAULT_BAUD,
+        gnss_fix=read_gnss_fix() if GNSS_SESSION is not None else None,
+        gnss_fix_quality=GNSS_FIX_QUALITY,
+        gnss_heading_pos_type=GNSS_HEADING_POS_TYPE,
+        gnss_heading_sol_status=GNSS_HEADING_SOL_STATUS,
+        gnss_detected=GNSS_DETECTED,
+        gnss_events=read_gnss_events(),
+        gnss_telemetry=read_gnss_telemetry(),
     )
 
 
@@ -841,6 +1098,76 @@ def sdr_lora_stop():
         ACTIVE_SDR_SESSION = None
         flash("LoRa activity detector stopped.", "ok")
     return redirect(url_for("index", _anchor="lora-tab"))
+
+
+@app.post("/gnss/detect")
+@require_auth
+def gnss_detect():
+    global GNSS_DETECTED
+    if GNSS_SESSION is not None:
+        flash("Stop the current GNSS session before detecting.", "error")
+        return redirect(url_for("index", _anchor="gnss-tab"))
+    if not list_serial_ports():
+        flash("No /dev/ttyUSB* or /dev/ttyACM* device detected — plug in the receiver first.", "error")
+        return redirect(url_for("index", _anchor="gnss-tab"))
+    found = detect_gnss_receiver()
+    if found is None:
+        GNSS_DETECTED = None
+        flash("No GNSS data found on any detected port/baud combination.", "error")
+        return redirect(url_for("index", _anchor="gnss-tab"))
+    port, baud = found
+    GNSS_DETECTED = {"port": port, "baud": baud}
+    flash(f"Detected GNSS receiver on {port} @ {baud} baud.", "ok")
+    return redirect(url_for("index", _anchor="gnss-tab"))
+
+
+@app.post("/gnss/start")
+@require_auth
+def gnss_start():
+    global GNSS_SESSION, GNSS_LAST_FIX_QUALITY, GNSS_LAST_HEADING_POS_TYPE, GNSS_LAST_TELEMETRY_TS
+    if GNSS_SESSION is not None:
+        flash("GNSS tracking is already running.", "error")
+        return redirect(url_for("index", _anchor="gnss-tab"))
+    port = request.form.get("port", "").strip()
+    if not valid_name(port):
+        flash("Enter a valid serial port.", "error")
+        return redirect(url_for("index", _anchor="gnss-tab"))
+    try:
+        baud = int(request.form.get("baud", GNSS_DEFAULT_BAUD))
+    except ValueError:
+        flash("Invalid baud rate.", "error")
+        return redirect(url_for("index", _anchor="gnss-tab"))
+    try:
+        connection, thread = start_gnss_tracking(port, baud)
+    except serial.SerialException as error:
+        flash(f"Could not open {port}: {error}", "error")
+        return redirect(url_for("index", _anchor="gnss-tab"))
+    GNSS_SESSION = {"serial": connection, "thread": thread}
+    with GNSS_LOCK:
+        GNSS_FIX.clear()
+        # New session = fresh transition baseline, even though GNSS_EVENTS/GNSS_TELEMETRY
+        # themselves are kept across start/stop cycles — so the first fix/heading of this
+        # session always logs as "acquired", not silently compared to a stale prior value.
+        GNSS_LAST_FIX_QUALITY = None
+        GNSS_LAST_HEADING_POS_TYPE = None
+        GNSS_LAST_TELEMETRY_TS = 0.0
+        _log_gnss_event(f"GNSS tracking started on {port} @ {baud} baud.")
+    flash(f"GNSS tracking started on {port} @ {baud} baud.", "ok")
+    return redirect(url_for("index", _anchor="gnss-tab"))
+
+
+@app.post("/gnss/stop")
+@require_auth
+def gnss_stop():
+    global GNSS_SESSION
+    if GNSS_SESSION is not None:
+        GNSS_SESSION["serial"].close()
+        GNSS_SESSION["thread"].join(timeout=5)
+        GNSS_SESSION = None
+        with GNSS_LOCK:
+            _log_gnss_event("GNSS tracking stopped.")
+        flash("GNSS tracking stopped.", "ok")
+    return redirect(url_for("index", _anchor="gnss-tab"))
 
 
 if __name__ == "__main__":
